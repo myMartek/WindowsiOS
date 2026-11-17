@@ -88,6 +88,7 @@ uint8_t *hv_alloc_no_footprint(uint64_t size);
 int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_t ram_size,
                       void *prealloc_ram, const char *code_fd_path, const char *vars_fd_path,
                       HvDisk *disk0, HvDisk *disk1, const uint8_t mac[6], int enable_sound);
+void hv_winvirt_destroy(HvWinVirt *b); /* visionmac: its memory and flash given back */
 void hv_winvirt_reset_cpu(HvWinVirt *b);
 void hv_winvirt_power_button(HvWinVirt *b);
 

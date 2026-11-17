@@ -7,6 +7,7 @@
 /* Before hv_net_attach: the Unix socket behind the guest's 10.0.2.4:80 (share.c). */
 void hv_net_set_share_socket(const char *path);
 /* User-mode NAT for the guest's virtio-net (see net_slirp.c). Returns 0 on success. */
+void hv_net_detach(void); /* visionmac: stops the network thread and frees what attach made */
 int hv_net_attach(HvMachine *m, HvVirtioNet *n);
 /* CPU thread, from the board's tick: hand frames for the guest to the device. */
 void hv_net_poll(void);

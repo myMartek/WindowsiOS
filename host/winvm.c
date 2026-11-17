@@ -30,6 +30,7 @@ static HvDisk disk1 = {.fd = -1};
 static int net_on;
 static int share_on;
 static _Atomic int stop_requested;
+static _Atomic int reset_count; /* restarts the guest asked for in this run (visionmac: hv_winvm_x_resets) */
 
 static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
 static CFTypeRef display_layer;
@@ -37,6 +38,10 @@ static int display_layer_set;
 static _Atomic(HvFbDisplay *) display_fb;
 
 static void (*exit_cb)(int reason);
+/* visionmac: for hv_winvm_destroy. */
+static int machine_built, handlers_installed;
+static pthread_t kicker_pthread;
+static int kicker_started;
 
 int hv_winvm_share_up(void) { return share_on; }
 HvMachine *hv_winvm_machine(void) { return &m; }
@@ -146,13 +151,17 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)
         return fail(err, errlen, "UEFI firmware (code.fd) and NVRAM (vars.fd) are required.");
 
+    if (machine_built) return fail(err, errlen, "The previous PC has not been taken down.");
     atomic_store(&stop_requested, 0);
+    atomic_store(&reset_count, 0);
+    machine_built = 1; /* from here hv_winvm_destroy has something to undo, however far this gets */
 
     struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
     ill.sa_sigaction = on_ill;
     sigaction(SIGILL, &ill, &prior_ill);
     sigaction(SIGBUS, &ill, &prior_bus);
     sigaction(SIGSEGV, &ill, &prior_segv);
+    handlers_installed = 1;
     signal(SIGPIPE, SIG_IGN);
 
     HvDisk *d0_ptr = NULL, *d1_ptr = NULL;
@@ -162,7 +171,8 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
         d0_ptr = &disk0;
     }
     if (c->disk1 && *c->disk1) {
-        if (hv_disk_open(&disk1, c->disk1, 0, 1) != 0)
+        /* visionmac: HV_DISK1_RW, for a service run: the second disk is the PC's own then, and has to take writes. */
+        if (hv_disk_open(&disk1, c->disk1, 0, getenv("HV_DISK1_RW") ? 0 : 1) != 0)
             return fail(err, errlen, "Cannot open secondary/installer disk image.");
         d1_ptr = &disk1;
     }
@@ -264,6 +274,7 @@ void hv_winvm_flush_disks(void) {
     if (disk0.fd >= 0) hv_disk_sync(&disk0);
 }
 
+
 int hv_winvm_run_cpu0(void) {
     prepare_cpu_thread();
     for (;;) {
@@ -272,6 +283,7 @@ int hv_winvm_run_cpu0(void) {
         /* PSCI SYSTEM_RESET sets halted == 2: perform warm reboot without tearing down RAM/JIT! */
         if (cpus[0].halted == 2 && !atomic_load(&stop_requested)) {
             fprintf(stderr, "winvm: guest requested PSCI SYSTEM_RESET — rebooting...\n");
+            atomic_fetch_add(&reset_count, 1);
             join_secondaries();
             /* Reset GIC, ITS, PCIe, and pflash state for warm reboot */
             if (board.gic) {
@@ -320,9 +332,7 @@ static void *cpu0_thread(void *unused) {
 void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason)) {
     exit_cb = on_exit;
     spawn_secondaries();
-    pthread_t kt;
-    pthread_create(&kt, NULL, kicker_thread, NULL);
-    pthread_detach(kt);
+    kicker_started = pthread_create(&kicker_pthread, NULL, kicker_thread, NULL) == 0;
     if (spawn_cpu0) {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
@@ -332,6 +342,43 @@ void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason)) {
         pthread_detach(ct);
         pthread_attr_destroy(&attr);
     }
+}
+
+/* visionmac: takes the PC down so that another can be built in the same process (the app could start Windows only
+   once in a launch). For after its CPUs have ended: from on_exit's callback, which runs on the first CPU's own
+   thread once the others are joined, or after a create that failed. Order matters: everything that reads the PC's
+   memory or its devices stops before they go. */
+void hv_winvm_destroy(void) {
+    if (!machine_built) return;
+    atomic_store(&stop_requested, 1);
+    if (kicker_started) {
+        pthread_join(kicker_pthread, NULL);
+        kicker_started = 0;
+    }
+    os_unfair_lock_lock(&display_lock);
+    HvFbDisplay *fb = atomic_exchange_explicit(&display_fb, NULL, memory_order_acq_rel);
+    os_unfair_lock_unlock(&display_lock);
+    if (fb) hv_fb_metal_stop(fb);
+    hv_audio_shutdown();
+    if (net_on) hv_net_detach();
+    net_on = 0;
+    share_on = 0;
+    hv_winvirt_destroy(&board);
+    hv_disk_close(&disk0);
+    hv_disk_close(&disk1);
+    hv_machine_free(&m);
+    memset(&m, 0, sizeof m);
+    memset(cpus, 0, sizeof cpus);
+    memset(sec_threads, 0, sizeof sec_threads);
+    ncpus = 1;
+    if (handlers_installed) {
+        sigaction(SIGILL, &prior_ill, NULL);
+        sigaction(SIGBUS, &prior_bus, NULL);
+        sigaction(SIGSEGV, &prior_segv, NULL);
+        handlers_installed = 0;
+    }
+    machine_built = 0;
+    fprintf(stderr, "winvm: the PC is taken down\n");
 }
 
 void hv_winvm_stop(void) {
@@ -400,4 +447,127 @@ void hv_winvm_engine_stats(uint64_t *jit_used_bytes, uint64_t *jit_cap_bytes,
     if (jit_cap_bytes) *jit_cap_bytes = (uint64_t)m.jit.capacity * 4ull;
     if (jit_full_flushes) *jit_full_flushes = m.stats.flush_full;
     if (wfi_ticks) *wfi_ticks = m.stats.wfi_ticks;
+}
+
+/* ---- visionmac: what xros/winvm_xros.h declares, for an app that also holds the engine this one came from ---- */
+
+#include "../xros/winvm_xros.h"
+
+static void (*x_exit)(int outcome);
+static char x_exit_text[96] = "";
+static os_unfair_lock x_ptr_lock = OS_UNFAIR_LOCK_INIT;
+static int x_ptr_x = 16384, x_ptr_y = 16384; /* 0..32767 */
+static uint8_t x_ptr_buttons;
+
+int hv_winvm_x_boot(const char *code_fd, const char *vars_fd, const char *disk, const char *installer, int installer_first,
+                    const char *share_dir, const char *share_sock, int cpu_count, uint64_t ram_mb,
+                    void *jit_rx, void *jit_rw, size_t jit_bytes, int sound, char *err, size_t errlen) {
+    /* installer_first (a service run on a Windows that is installed): the firmware starts what it finds first, and
+       with the PC's disk first that is Windows. So the two change places, and the PC's disk, now second, stays
+       writable. vars_fd should then be a fresh one: the PC's own names Windows's boot manager first. */
+    if (installer && installer_first) setenv("HV_DISK1_RW", "1", 1);
+    else unsetenv("HV_DISK1_RW");
+    HvWinVmConfig c = {.code_fd = code_fd, .vars_fd = vars_fd, .disk0 = installer && installer_first ? installer : disk,
+                       .disk1 = installer && installer_first ? disk : installer, .share_dir = share_dir,
+                       .share_sock = share_sock, .ncpus = cpu_count, .ram_mb = ram_mb, .jit_bytes = jit_bytes, .jit_rx = jit_rx,
+                       .jit_rw = jit_rw, .enable_sound = sound, .stats_interval = getenv("HV_STATS") ? atoi(getenv("HV_STATS")) : 0};
+    x_exit_text[0] = 0;
+    x_ptr_buttons = 0;
+    int r = hv_winvm_create(&c, err, errlen);
+    if (r != 0) hv_winvm_destroy(); /* whatever it had built */
+    return r;
+}
+
+void hv_winvm_x_destroy(void) { hv_winvm_destroy(); }
+
+static void x_on_exit(int reason) {
+    int halt = (int)cpus[0].halted;
+    int outcome = reason == HV_EXIT_HALT && halt == 1 ? HV_WINVM_X_SHUTDOWN : reason == HV_EXIT_HALT && halt == 3 ? HV_WINVM_X_HOST_STOP : HV_WINVM_X_ERROR;
+    snprintf(x_exit_text, sizeof x_exit_text, "%s", outcome == HV_WINVM_X_SHUTDOWN ? "Windows shut down" : outcome == HV_WINVM_X_HOST_STOP ? "stopped by host" : hv_winvm_reason_name(reason));
+    fprintf(stderr, "winvm: the PC stopped (%s, halt %d)\n", x_exit_text, halt);
+    if (x_exit) x_exit(outcome);
+}
+
+void hv_winvm_x_run(void (*on_exit)(int outcome)) {
+    x_exit = on_exit;
+    hv_winvm_start(1, x_on_exit);
+}
+
+const char *hv_winvm_x_exit_text(void) { return x_exit_text; }
+void hv_winvm_x_stop(void) { hv_winvm_stop(); }
+void hv_winvm_x_power_button(void) { hv_winvm_power_button(); }
+void hv_winvm_x_set_layer(void *layer) { hv_winvm_set_display_layer(layer); }
+int hv_winvm_x_screen(uint32_t *w, uint32_t *h) { return hv_winvm_display_size(w, h); }
+uint64_t hv_winvm_x_frames(void) { return hv_winvm_display_frames(); }
+uint64_t hv_winvm_x_blocks(void) { return m.stats.blocks; }
+uint64_t hv_winvm_x_net_frames(int sent) { return sent ? hv_net_tx_frames : hv_net_rx_frames; }
+int hv_winvm_x_net_up(void) { return net_on; }
+int hv_winvm_x_resets(void) { return atomic_load(&reset_count); }
+
+int hv_winvm_x_cpus_on(void) {
+    int n = 0;
+    for (int i = 0; i < ncpus; i++) n += !cpus[i].off;
+    return n;
+}
+
+int hv_winvm_x_user_code(void) {
+    for (int i = 0; i < ncpus; i++)
+        if (!cpus[i].off && cpus[i].el == 0) return 1;
+    return 0;
+}
+
+void hv_winvm_x_key_hid(uint8_t usage, int down) { hv_winvm_key_hid(usage, down); }
+void hv_winvm_x_key_linux(uint16_t code, int down) { hv_winvm_key_linux(code, down); }
+
+static void x_pointer_send(int8_t wheel) {
+    os_unfair_lock_lock(&x_ptr_lock);
+    int x = x_ptr_x, y = x_ptr_y;
+    uint8_t buttons = x_ptr_buttons;
+    os_unfair_lock_unlock(&x_ptr_lock);
+    hv_winvm_tablet(x / 32767.0, y / 32767.0, buttons, wheel);
+}
+
+static int x_clamp(int v) { return v < 0 ? 0 : v > 32767 ? 32767 : v; }
+
+void hv_winvm_x_pointer_at(int x, int y) {
+    os_unfair_lock_lock(&x_ptr_lock);
+    x_ptr_x = x_clamp(x), x_ptr_y = x_clamp(y);
+    os_unfair_lock_unlock(&x_ptr_lock);
+    x_pointer_send(0);
+}
+
+void hv_winvm_x_pointer_button(int button, int down) {
+    if (button < 0 || button > 2) return;
+    os_unfair_lock_lock(&x_ptr_lock);
+    uint8_t bit = (uint8_t)(1u << button);
+    x_ptr_buttons = down ? x_ptr_buttons | bit : x_ptr_buttons & (uint8_t)~bit;
+    os_unfair_lock_unlock(&x_ptr_lock);
+    x_pointer_send(0);
+}
+
+void hv_winvm_x_pointer_wheel(int amount) {
+    while (amount) {
+        int piece = amount > 100 ? 100 : amount < -100 ? -100 : amount;
+        x_pointer_send((int8_t)piece);
+        amount -= piece;
+    }
+}
+
+void hv_winvm_x_pointer_step(int dx, int dy) {
+    uint32_t w = 0, h = 0;
+    if (hv_winvm_display_size(&w, &h) != 0 || !w || !h) w = 1920, h = 1080;
+    os_unfair_lock_lock(&x_ptr_lock);
+    x_ptr_x = x_clamp(x_ptr_x + (int)((int64_t)dx * 32767 / (int)w));
+    x_ptr_y = x_clamp(x_ptr_y + (int)((int64_t)dy * 32767 / (int)h));
+    os_unfair_lock_unlock(&x_ptr_lock);
+    x_pointer_send(0);
+}
+
+int hv_winvm_x_pointer(int *x, int *y) {
+    uint32_t w = 0, h = 0;
+    if (hv_winvm_display_size(&w, &h) != 0 || !w || !h) return -1;
+    os_unfair_lock_lock(&x_ptr_lock);
+    *x = (int)((int64_t)x_ptr_x * (int)(w - 1) / 32767), *y = (int)((int64_t)x_ptr_y * (int)(h - 1) / 32767);
+    os_unfair_lock_unlock(&x_ptr_lock);
+    return 0;
 }

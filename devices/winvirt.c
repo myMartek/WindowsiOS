@@ -62,12 +62,16 @@ struct PrefaultArgs {
     uint64_t size;
 };
 
+/* visionmac: the thread touches the PC's memory, which hv_winvirt_destroy unmaps: it is told to stop and waited for. */
+static _Atomic int prefault_active, prefault_cancel;
+
 static void *prefault_thread(void *arg) {
     struct PrefaultArgs a = *(struct PrefaultArgs *)arg;
     free(arg);
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-    for (uint64_t off = 0; off < a.size; off += 0x1000)
+    for (uint64_t off = 0; off < a.size && !atomic_load(&prefault_cancel); off += 0x1000)
         __atomic_fetch_add((volatile uint64_t *)(a.ram + off), 0, __ATOMIC_RELAXED);
+    atomic_store(&prefault_active, 0);
     return NULL;
 }
 
@@ -145,8 +149,10 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
                 a->ram = b->ram;
                 a->size = ram_size;
                 pthread_t t;
+                atomic_store(&prefault_cancel, 0);
+                atomic_store(&prefault_active, 1);
                 if (pthread_create(&t, NULL, prefault_thread, a) == 0) pthread_detach(t);
-                else free(a);
+                else free(a), atomic_store(&prefault_active, 0);
             }
         }
     }
@@ -213,6 +219,20 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
     m->tick = tick;
     m->tick_opaque = b;
     return 0;
+}
+
+/* visionmac: gives back what a PC holds that matters: its memory (gigabytes) and the two flash images (64 MB each,
+   the variables written out). Its devices' own small structures stay allocated: none of them has a thread, and none
+   has a way to be freed; a few hundred kilobytes a run. Safe on a board hv_winvirt_create left half built. Nothing
+   of the PC may be running: its CPUs, its display's presenter and its network are stopped first (hv_winvm_destroy). */
+void hv_winvirt_destroy(HvWinVirt *b) {
+    atomic_store(&prefault_cancel, 1);
+    while (atomic_load(&prefault_active)) usleep(1000);
+    if (b->flash0) hv_pflash_close(b->flash0);
+    if (b->flash1) hv_pflash_close(b->flash1);
+    if (b->ram && b->ram != MAP_FAILED && b->ram_size) munmap(b->ram, b->ram_size);
+    free(b->dtb);
+    memset(b, 0, sizeof *b);
 }
 
 void hv_winvirt_reset_cpu(HvWinVirt *b) {

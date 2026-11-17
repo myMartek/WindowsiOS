@@ -7,6 +7,7 @@
    a pipe); frames for the guest are queued the other way and handed to the
    virtio-net device on the CPU thread (hv_net_poll), which may only take them
    when the guest has posted receive buffers. */
+#include <stdatomic.h>
 #include "net_slirp.h"
 #include "share.h"
 
@@ -311,9 +312,14 @@ static const SlirpCb callbacks = {
 
 /* ---- the network thread ---- */
 
+/* visionmac: the PC can be taken down and built again in one process (hv_net_detach). */
+static _Atomic int net_stopping;
+static pthread_t net_pthread;
+static int net_started, net_queues;
+
 static void *net_thread(void *unused) {
     (void)unused;
-    for (;;) {
+    while (!atomic_load(&net_stopping)) {
         uint32_t timeout = 1000;
         int64_t now = now_ms();
         for (int i = 0; i < MAX_TIMERS; i++)
@@ -399,10 +405,46 @@ void hv_net_poll(void) {
     }
 }
 
+void hv_net_detach(void) {
+    atomic_store(&net_stopping, 1);
+    if (net_started) {
+        char byte = 0;
+        (void)!write(wake_pipe[1], &byte, 1);
+        pthread_join(net_pthread, NULL);
+        net_started = 0;
+    }
+    if (net) net->transmit = NULL;
+    if (slirp) slirp_cleanup(slirp);
+    slirp = NULL;
+    if (net_queues) {
+        Queue *queues[] = {&to_guest, &to_host};
+        for (int i = 0; i < 2; i++) {
+            Queue *q = queues[i];
+            while (q->head != q->tail) free(q->f[q->head++ % QUEUE].data);
+            pthread_mutex_destroy(&q->mu);
+            memset(q, 0, sizeof *q);
+        }
+        net_queues = 0;
+        for (int i = 0; i < 2; i++) {
+            if (wake_pipe[i] > 0) close(wake_pipe[i]);
+            wake_pipe[i] = 0;
+        }
+    }
+    memset(timers, 0, sizeof timers);
+    pthread_mutex_lock(&fwd_mu);
+    npending_fwds = 0;
+    nactive_fwds = 0;
+    pthread_mutex_unlock(&fwd_mu);
+    net = NULL;
+    machine = NULL;
+}
+
 int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     machine = m;
+    atomic_store(&net_stopping, 0);
     pthread_mutex_init(&to_guest.mu, NULL);
     pthread_mutex_init(&to_host.mu, NULL);
+    net_queues = 1;
     if (pipe(wake_pipe) != 0) return -1;
     fcntl(wake_pipe[0], F_SETFL, O_NONBLOCK);
     fcntl(wake_pipe[1], F_SETFL, O_NONBLOCK);
@@ -436,7 +478,6 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     }
     net = n;
     n->transmit = transmit;
-    pthread_t t;
-    pthread_create(&t, NULL, net_thread, NULL);
+    net_started = pthread_create(&net_pthread, NULL, net_thread, NULL) == 0;
     return 0;
 }

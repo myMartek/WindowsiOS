@@ -44,6 +44,7 @@ static NSString *const kFbShaderSource =
     id<MTLTexture> texture;
     uint32_t texW, texH;
     dispatch_source_t timer;
+    dispatch_queue_t tickQueue;
     _Atomic(uint64_t) framesPresented;
     uint64_t lastHash;
     CGSize lastDrawableSize;
@@ -51,6 +52,7 @@ static NSString *const kFbShaderSource =
 - (instancetype)initWithDisplay:(HvFbDisplay *)display;
 - (void)setTargetLayer:(CAMetalLayer *)newLayer;
 - (void)tick;
+- (void)shutdown;
 @end
 
 @implementation HvFbMetalPresenter
@@ -77,6 +79,7 @@ static NSString *const kFbShaderSource =
 }
 
 - (void)setTargetLayer:(CAMetalLayer *)newLayer {
+    fprintf(stderr, "winvm: fb-metal: layer %s\n", newLayer ? "set" : "taken away");
     os_unfair_lock_lock(&lock);
     layer = newLayer;
     lastHash = 0;
@@ -92,6 +95,7 @@ static NSString *const kFbShaderSource =
 
         if (!timer) {
             dispatch_queue_t q = dispatch_queue_create("me.ammaar.windowsios.fbmetal", DISPATCH_QUEUE_SERIAL);
+            tickQueue = q;
             timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
             dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 60, 2 * NSEC_PER_MSEC);
             __weak HvFbMetalPresenter *weakSelf = self;
@@ -130,13 +134,21 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
         os_unfair_lock_lock(&lock);
         CAMetalLayer *curLayer = layer;
         if (!curLayer || !device || !pipeline || !queue) {
+            static int said;
+            if (!said++) fprintf(stderr, "winvm: fb-metal: cannot draw (layer %d, device %d, pipeline %d, queue %d)\n", curLayer != nil, device != nil, pipeline != nil, queue != nil);
             os_unfair_lock_unlock(&lock);
             return;
         }
 
         CGSize dsize = curLayer.drawableSize;
         if (dsize.width < 4 || dsize.height < 4) {
+            /* visionmac: a layer nobody gave a drawable size (the app's is made for the other engine, which sets its
+               own): the picture's. */
+            static int said;
+            if (!said++) fprintf(stderr, "winvm: fb-metal: the layer has no drawable size (%.0f x %.0f); giving it the picture's, %u x %u\n", dsize.width, dsize.height, w, h);
+            CGSize want = CGSizeMake(w, h);
             os_unfair_lock_unlock(&lock);
+            dispatch_async(dispatch_get_main_queue(), ^{ curLayer.drawableSize = want; });
             return;
         }
 
@@ -165,6 +177,8 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
 
         id<CAMetalDrawable> drawable = [curLayer nextDrawable];
         if (!drawable) {
+            static int said;
+            if (!said++) fprintf(stderr, "winvm: fb-metal: the layer gave no drawable (%.0f x %.0f)\n", dsize.width, dsize.height);
             os_unfair_lock_unlock(&lock);
             return;
         }
@@ -201,7 +215,30 @@ static uint64_t quick_frame_hash(const uint8_t *px, uint32_t w, uint32_t h, uint
     }
 }
 
+- (void)shutdown {
+    os_unfair_lock_lock(&lock);
+    layer = nil;
+    dispatch_source_t t = timer;
+    dispatch_queue_t q = tickQueue;
+    timer = nil;
+    os_unfair_lock_unlock(&lock);
+    if (t) dispatch_source_cancel(t);
+    if (q) dispatch_sync(q, ^{}); /* a tick under way, or queued before the cancel, is over once this returns */
+}
 @end
+
+/* visionmac: the PC is being taken down. No frame is drawn after this returns: the timer is cancelled and whatever
+   it had running or queued is waited for, since the next thing to go is the memory the frames are read from. */
+void hv_fb_metal_stop(HvFbDisplay *fb) {
+    if (!fb) return;
+    pthread_mutex_lock(&fb->mu);
+    void *handle = fb->metal;
+    fb->metal = NULL;
+    pthread_mutex_unlock(&fb->mu);
+    if (!handle) return;
+    HvFbMetalPresenter *p = (__bridge_transfer HvFbMetalPresenter *)handle;
+    [p shutdown];
+}
 
 static HvFbMetalPresenter *ensure_presenter(HvFbDisplay *fb) {
     if (!fb) return nil;
